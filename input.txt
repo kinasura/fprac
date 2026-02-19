@@ -1,0 +1,4 @@
+Hello, World!
+This is a test file for XOR encryption.
+It contains multiple lines and some special characters: !@#$%^&*().
+Также здесь есть русский текст и нулевые байты, но в текстовом файле их нет.
