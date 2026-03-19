@@ -12,16 +12,16 @@ testfile:
 	dd if=/dev/urandom of=test10M.bin bs=1M count=10
 
 test_secure: $(TARGET) testfile
-	@echo "Шифрование test10M.bin в encrypted.bin с ключом 123"
+	@echo "РЁРёС„СЂРѕРІР°РЅРёРµ test10M.bin РІ encrypted.bin СЃ РєР»СЋС‡РѕРј 123"
 	./$(TARGET) test10M.bin encrypted.bin 123
-	@echo "Дешифрование encrypted.bin в decrypted.bin с ключом 123"
+	@echo "Р”РµС€РёС„СЂРѕРІР°РЅРёРµ encrypted.bin РІ decrypted.bin СЃ РєР»СЋС‡РѕРј 123"
 	./$(TARGET) encrypted.bin decrypted.bin 123
-	@echo "Сравнение исходного и расшифрованного файлов:"
-	cmp test10M.bin decrypted.bin && echo "ТЕСТ ПРОЙДЕН" || echo "ТЕСТ НЕ ПРОЙДЕН"
+	@echo "РЎСЂР°РІРЅРµРЅРёРµ РёСЃС…РѕРґРЅРѕРіРѕ Рё СЂР°СЃС€РёС„СЂРѕРІР°РЅРЅРѕРіРѕ С„Р°Р№Р»РѕРІ:"
+	cmp test10M.bin decrypted.bin && echo "РўР•РЎРў РџР РћР™Р”Р•Рќ" || echo "РўР•РЎРў РќР• РџР РћР™Р”Р•Рќ"
 	@rm -f encrypted.bin decrypted.bin
 
 test_interrupt: $(TARGET) testfile
-	@echo "Запустите программу и нажмите Ctrl+C:"
+	@echo "Р—Р°РїСѓСЃС‚РёС‚Рµ РїСЂРѕРіСЂР°РјРјСѓ Рё РЅР°Р¶РјРёС‚Рµ Ctrl+C:"
 	./$(TARGET) test10M.bin interrupted.bin 123
 
 clean:
