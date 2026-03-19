@@ -1,189 +1,194 @@
 // secure_copy.cpp
+// Многопоточное копирование с шифрованием нескольких файлов
+// Использует libcaesar.so
+
 #include <iostream>
 #include <fstream>
-#include <cstring>
-#include <cstdlib>
+#include <string>
+#include <queue>
 #include <csignal>
-#include <unistd.h>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
 #include <pthread.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/syscall.h>
+#include <errno.h>
 
-// Размер блока данных
+#define _GNU_SOURCE
+
+// Размер блока для чтения/записи
 const size_t BLOCK_SIZE = 4096;
-// Размер очереди (количество блоков)
-const size_t QUEUE_SIZE = 10;
+// Количество рабочих потоков
+const int NUM_THREADS = 3;
 
-// Структура блока данных
-struct DataBlock {
-    char data[BLOCK_SIZE];
-    size_t size;      // реальный размер (может быть меньше BLOCK_SIZE для последнего блока)
-};
-
-// Глобальный флаг для сигнала (должен быть перед классом, который его использует)
+// Флаг для сигнала
 volatile sig_atomic_t keep_running = 1;
 
-// Очередь с ограниченным размером (кольцевой буфер)
-class BlockingQueue {
-public:
-    BlockingQueue(size_t maxSize) : maxSize(maxSize), head(0), tail(0), count(0) {
-        buffer = new DataBlock*[maxSize];
-        pthread_mutex_init(&mutex, nullptr);
-        pthread_cond_init(&condNotEmpty, nullptr);
-        pthread_cond_init(&condNotFull, nullptr);
-    }
-
-    ~BlockingQueue() {
-        pthread_mutex_destroy(&mutex);
-        pthread_cond_destroy(&condNotEmpty);
-        pthread_cond_destroy(&condNotFull);
-        delete[] buffer;
-    }
-
-    void push(DataBlock* block) {
-        pthread_mutex_lock(&mutex);
-        while (count >= maxSize && keep_running) {
-            pthread_cond_wait(&condNotFull, &mutex);
-        }
-        if (!keep_running) {
-            pthread_mutex_unlock(&mutex);
-            return;
-        }
-        buffer[tail] = block;
-        tail = (tail + 1) % maxSize;
-        count++;
-        pthread_cond_signal(&condNotEmpty);
-        pthread_mutex_unlock(&mutex);
-    }
-
-    DataBlock* pop() {
-        pthread_mutex_lock(&mutex);
-        while (count == 0 && keep_running) {
-            pthread_cond_wait(&condNotEmpty, &mutex);
-        }
-        if (!keep_running) {
-            pthread_mutex_unlock(&mutex);
-            return nullptr;
-        }
-        DataBlock* block = buffer[head];
-        head = (head + 1) % maxSize;
-        count--;
-        pthread_cond_signal(&condNotFull);
-        pthread_mutex_unlock(&mutex);
-        return block;
-    }
-
-private:
-    DataBlock** buffer;
-    size_t maxSize;
-    size_t head;
-    size_t tail;
-    size_t count;
-    pthread_mutex_t mutex;
-    pthread_cond_t condNotEmpty;
-    pthread_cond_t condNotFull;
+// Очередь задач
+struct Task {
+    std::string inPath;
+    std::string outPath;
 };
 
-// Обработчик SIGINT
-void sigint_handler(int) {
-    keep_running = 0;
-}
+std::queue<Task> taskQueue;
+pthread_mutex_t queueMutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t queueCond = PTHREAD_COND_INITIALIZER;
 
-// Структура для передачи аргументов в потоки
-struct ThreadArgs {
-    std::string inputFile;
-    std::string outputFile;
-    unsigned char key;
-    BlockingQueue* queue;
-};
+// Мьютекс для логирования
+pthread_mutex_t logMutex = PTHREAD_MUTEX_INITIALIZER;
 
-// Объявление функций из библиотеки libcaesar
+// Функции из библиотеки libcaesar
 extern "C" {
     void set_key(char key);
     void caesar(void* src, void* dst, int len);
 }
 
-// Поток-производитель
-void* producerThread(void* arg) {
-    ThreadArgs* args = static_cast<ThreadArgs*>(arg);
-    std::ifstream inFile(args->inputFile, std::ios::binary);
-    if (!inFile) {
-        std::cerr << "Ошибка: не удалось открыть входной файл " << args->inputFile << std::endl;
-        keep_running = 0;
-        return nullptr;
-    }
-
-    set_key(static_cast<char>(args->key));
-
-    while (keep_running) {
-        DataBlock* block = new DataBlock;
-        inFile.read(block->data, BLOCK_SIZE);
-        block->size = inFile.gcount();
-
-        if (block->size == 0) {
-            delete block;
-            break;
-        }
-
-        // Шифрование на месте
-        caesar(block->data, block->data, static_cast<int>(block->size));
-
-        args->queue->push(block);
-
-        if (inFile.eof()) break;
-    }
-
-    // Маркер конца
-    DataBlock* endBlock = new DataBlock;
-    endBlock->size = 0;
-    args->queue->push(endBlock);
-
-    inFile.close();
-    return nullptr;
+// Получение системного идентификатора потока
+pid_t gettid() {
+    return static_cast<pid_t>(syscall(SYS_gettid));
 }
 
-// Поток-потребитель
-void* consumerThread(void* arg) {
-    ThreadArgs* args = static_cast<ThreadArgs*>(arg);
-    std::ofstream outFile(args->outputFile, std::ios::binary);
-    if (!outFile) {
-        std::cerr << "Ошибка: не удалось открыть выходной файл " << args->outputFile << std::endl;
-        keep_running = 0;
-        return nullptr;
+// Обработчик сигнала SIGINT
+void sigint_handler(int) {
+    keep_running = 0;
+    // Разбудим ожидающие потоки (не обязательно, но полезно)
+    pthread_cond_broadcast(&queueCond);
+}
+
+// Функция обработки одного файла
+void processFile(const std::string& inPath, const std::string& outPath) {
+    std::ifstream inFile(inPath, std::ios::binary);
+    if (!inFile) {
+        std::cerr << "Ошибка: не удалось открыть входной файл " << inPath << std::endl;
+        return;
     }
 
-    while (keep_running) {
-        DataBlock* block = args->queue->pop();
-        if (!block) break;
+    // Создаем выходной файл, предварительно создавая директорию? Директория уже создана в main.
+    std::ofstream outFile(outPath, std::ios::binary);
+    if (!outFile) {
+        std::cerr << "Ошибка: не удалось создать выходной файл " << outPath << std::endl;
+        return;
+    }
 
-        if (block->size == 0) {
-            delete block;
+    char buffer[BLOCK_SIZE];
+    bool success = true;
+
+    while (keep_running) {
+        inFile.read(buffer, BLOCK_SIZE);
+        std::streamsize bytesRead = inFile.gcount();
+        if (bytesRead == 0) break;
+
+        // Шифрование
+        caesar(buffer, buffer, static_cast<int>(bytesRead));
+
+        outFile.write(buffer, bytesRead);
+        if (!outFile) {
+            std::cerr << "Ошибка записи в файл " << outPath << std::endl;
+            success = false;
+            break;
+        }
+    }
+
+    inFile.close();
+    outFile.close();
+
+    // Если операция была прервана, не логируем
+    if (!keep_running) {
+        std::cerr << "Операция прервана во время обработки файла " << inPath << std::endl;
+        return;
+    }
+
+    if (!success) return;
+
+    // Логирование успешной обработки
+    pthread_mutex_lock(&logMutex);
+    std::ofstream logFile("log.txt", std::ios::app);
+    if (logFile) {
+        time_t now = time(nullptr);
+        struct tm* tm_info = localtime(&now);
+        char timeBuf[20];
+        strftime(timeBuf, sizeof(timeBuf), "%Y-%m-%d %H:%M:%S", tm_info);
+        pid_t pid = getpid();
+        pid_t tid = gettid();
+        logFile << timeBuf << " PID:" << pid << " TID:" << tid << " " << inPath << std::endl;
+        logFile.close();
+    } else {
+        std::cerr << "Ошибка открытия файла лога" << std::endl;
+    }
+    pthread_mutex_unlock(&logMutex);
+}
+
+// Рабочая функция потока
+void* worker(void*) {
+    while (keep_running) {
+        // Захват мьютекса очереди с таймаутом 5 секунд
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += 5;
+        int rc = pthread_mutex_timedlock(&queueMutex, &ts);
+        if (rc == ETIMEDOUT) {
+            std::cerr << "Deadlock: не удалось захватить мьютекс очереди в течение 5 секунд. Завершение." << std::endl;
+            exit(1);
+        } else if (rc != 0) {
+            std::cerr << "Ошибка захвата мьютекса: " << rc << std::endl;
+            exit(1);
+        }
+
+        // Ожидание появления задач с периодической проверкой keep_running
+        while (taskQueue.empty() && keep_running) {
+            struct timespec wait_ts;
+            clock_gettime(CLOCK_REALTIME, &wait_ts);
+            wait_ts.tv_sec += 1; // ждем 1 секунду
+            pthread_cond_timedwait(&queueCond, &queueMutex, &wait_ts);
+        }
+
+        if (!keep_running) {
+            pthread_mutex_unlock(&queueMutex);
             break;
         }
 
-        outFile.write(block->data, block->size);
-        delete block;
-    }
+        // Извлекаем задачу
+        Task task = taskQueue.front();
+        taskQueue.pop();
+        pthread_mutex_unlock(&queueMutex);
 
-    outFile.close();
+        // Если это маркер завершения, выходим
+        if (task.inPath.empty()) {
+            break;
+        }
+
+        // Обрабатываем файл
+        processFile(task.inPath, task.outPath);
+    }
     return nullptr;
 }
 
 int main(int argc, char* argv[]) {
-    if (argc != 4) {
-        std::cerr << "Использование: " << argv[0] << " <входной_файл> <выходной_файл> <ключ>" << std::endl;
+    if (argc < 4) {
+        std::cerr << "Использование: " << argv[0] << " <file1> [file2 ...] <out_dir> <key>" << std::endl;
         return 1;
     }
 
-    std::string inputFile = argv[1];
-    std::string outputFile = argv[2];
+    // Извлекаем аргументы
+    std::string outDir = argv[argc - 2];
     char* endptr;
-    long keyLong = strtol(argv[3], &endptr, 10);
+    long keyLong = strtol(argv[argc - 1], &endptr, 10);
     if (*endptr != '\0' || keyLong < 0 || keyLong > 255) {
         std::cerr << "Ошибка: ключ должен быть целым числом от 0 до 255" << std::endl;
         return 1;
     }
     unsigned char key = static_cast<unsigned char>(keyLong);
 
-    // Установка обработчика SIGINT
+    // Создаем выходную директорию, если её нет
+    if (mkdir(outDir.c_str(), 0777) != 0 && errno != EEXIST) {
+        std::cerr << "Ошибка создания директории " << outDir << std::endl;
+        return 1;
+    }
+
+    // Устанавливаем обработчик сигнала
     struct sigaction sa;
     sa.sa_handler = sigint_handler;
     sigemptyset(&sa.sa_mask);
@@ -193,27 +198,65 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    BlockingQueue queue(QUEUE_SIZE);
-    ThreadArgs args = {inputFile, outputFile, key, &queue};
+    // Устанавливаем ключ шифрования (один для всех)
+    set_key(static_cast<char>(key));
 
-    pthread_t producer, consumer;
-    if (pthread_create(&producer, nullptr, producerThread, &args) != 0) {
-        std::cerr << "Ошибка создания потока-производителя" << std::endl;
-        return 1;
-    }
-    if (pthread_create(&consumer, nullptr, consumerThread, &args) != 0) {
-        std::cerr << "Ошибка создания потока-потребителя" << std::endl;
-        pthread_cancel(producer);
-        pthread_join(producer, nullptr);
-        return 1;
+    // Формируем задачи для всех входных файлов
+    int numFiles = argc - 3;
+    for (int i = 1; i <= numFiles; ++i) {
+        std::string inPath = argv[i];
+        // Извлекаем имя файла без пути
+        size_t pos = inPath.find_last_of("/\\");
+        std::string filename = (pos == std::string::npos) ? inPath : inPath.substr(pos + 1);
+        std::string outPath = outDir + "/" + filename;
+
+        Task task;
+        task.inPath = inPath;
+        task.outPath = outPath;
+
+        pthread_mutex_lock(&queueMutex);
+        taskQueue.push(task);
+        pthread_cond_signal(&queueCond);
+        pthread_mutex_unlock(&queueMutex);
     }
 
-    pthread_join(producer, nullptr);
-    pthread_join(consumer, nullptr);
+    // Создаем рабочие потоки
+    pthread_t threads[NUM_THREADS];
+    for (int i = 0; i < NUM_THREADS; ++i) {
+        if (pthread_create(&threads[i], nullptr, worker, nullptr) != 0) {
+            std::cerr << "Ошибка создания потока " << i << std::endl;
+            // Завершаем уже созданные потоки
+            for (int j = 0; j < i; ++j) {
+                pthread_cancel(threads[j]); // не лучший способ, но для простоты
+                pthread_join(threads[j], nullptr);
+            }
+            return 1;
+        }
+    }
+
+    // Добавляем маркеры завершения (по одному на поток)
+    for (int i = 0; i < NUM_THREADS; ++i) {
+        Task stopTask;
+        stopTask.inPath = ""; // пустой путь означает маркер
+        pthread_mutex_lock(&queueMutex);
+        taskQueue.push(stopTask);
+        pthread_cond_signal(&queueCond);
+        pthread_mutex_unlock(&queueMutex);
+    }
+
+    // Ожидаем завершения всех потоков
+    for (int i = 0; i < NUM_THREADS; ++i) {
+        pthread_join(threads[i], nullptr);
+    }
 
     if (!keep_running) {
         std::cout << "Операция прервана пользователем" << std::endl;
     }
+
+    // Очистка ресурсов (необязательно, т.к. программа завершается)
+    pthread_mutex_destroy(&queueMutex);
+    pthread_cond_destroy(&queueCond);
+    pthread_mutex_destroy(&logMutex);
 
     return 0;
 }
