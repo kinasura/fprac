@@ -1,30 +1,30 @@
 CC = g++
-CFLAGS = -Wall -Wextra -pedantic -fPIC
-TARGET = libcaesar.so
-TEST_SCRIPT = test_caesar.py
-INPUT_FILE = input.txt
+CFLAGS = -Wall -pthread
+TARGET = secure_copy
+LIB = libcaesar.so
 
 all: $(TARGET)
 
-$(TARGET): caesar.cpp
-	$(CC) -shared $(CFLAGS) $< -o $@
+$(TARGET): secure_copy.cpp $(LIB)
+	$(CC) $(CFLAGS) -o $@ $< -L. -lcaesar
 
-install: $(TARGET)
-	sudo cp $(TARGET) /usr/local/lib/
-	sudo ldconfig
+testfile:
+	dd if=/dev/urandom of=test10M.bin bs=1M count=10
 
-test: $(TARGET) $(INPUT_FILE)
-	@echo "РЁРёС„СЂРѕРІР°РЅРёРµ РІС…РѕРґРЅРѕРіРѕ С„Р°Р№Р»Р° СЃ РєР»СЋС‡РѕРј 42 -> output.enc"
-	python3 $(TEST_SCRIPT) ./$(TARGET) 42 $(INPUT_FILE) output.enc
-	@echo "Р”РµС€РёС„СЂРѕРІР°РЅРёРµ output.enc СЃ С‚РµРј Р¶Рµ РєР»СЋС‡РѕРј -> output.dec"
-	python3 $(TEST_SCRIPT) ./$(TARGET) 42 output.enc output.dec
-	@echo "РЎСЂР°РІРЅРµРЅРёРµ РёСЃС…РѕРґРЅРѕРіРѕ С„Р°Р№Р»Р° Рё СЂР°СЃС€РёС„СЂРѕРІР°РЅРЅРѕРіРѕ:"
-	cmp $(INPUT_FILE) output.dec && \
-		echo "РўР•РЎРў РџР РћР™Р”Р•Рќ: С„Р°Р№Р»С‹ РёРґРµРЅС‚РёС‡РЅС‹" || \
-		(echo "РўР•РЎРў РќР• РџР РћР™Р”Р•Рќ: С„Р°Р№Р»С‹ СЂР°Р·Р»РёС‡Р°СЋС‚СЃСЏ" && exit 1)
-	@rm -f output.enc output.dec
+test_secure: $(TARGET) testfile
+	@echo "Шифрование test10M.bin в encrypted.bin с ключом 123"
+	./$(TARGET) test10M.bin encrypted.bin 123
+	@echo "Дешифрование encrypted.bin в decrypted.bin с ключом 123"
+	./$(TARGET) encrypted.bin decrypted.bin 123
+	@echo "Сравнение исходного и расшифрованного файлов:"
+	cmp test10M.bin decrypted.bin && echo "ТЕСТ ПРОЙДЕН" || echo "ТЕСТ НЕ ПРОЙДЕН"
+	@rm -f encrypted.bin decrypted.bin
+
+test_interrupt: $(TARGET) testfile
+	@echo "Запустите программу и нажмите Ctrl+C:"
+	./$(TARGET) test10M.bin interrupted.bin 123
 
 clean:
-	rm -f $(TARGET) output.enc output.dec
+	rm -f $(TARGET) test10M.bin encrypted.bin decrypted.bin interrupted.bin
 
-.PHONY: all install test clean
+.PHONY: all testfile test_secure test_interrupt clean
