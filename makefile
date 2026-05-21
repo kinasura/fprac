@@ -1,12 +1,11 @@
 CC = g++
-CFLAGS = -Wall -pthread -std=c++11
-LDFLAGS = -L. -lcaesar -lrt
-TARGET = secure_copy
+CFLAGS = -Wall -Wextra -pedantic -fPIC -D_GNU_SOURCE
+TARGET = libcaesar.so
 
 all: $(TARGET)
 
-$(TARGET): secure_copy.cpp
-	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+$(TARGET): caesar.cpp
+	$(CC) -shared $(CFLAGS) $< -o $@
 
 clean:
 	rm -f $(TARGET)
