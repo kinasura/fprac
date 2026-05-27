@@ -2,7 +2,6 @@
 # Compiled and build artifacts
 *.o
 *.obj
-*.bin
 *.exe
 *.dll
 *.so
@@ -13,24 +12,67 @@
 venv/
 .venv/
 __pycache__/
-node_modules/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+.venv.bak/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Build directories
+build/
+dist/
+*.egg
+*.egg-info/
+.coverage
+htmlcov/
+.coverage.*
+.nox/
+.tox/
 
 # Logs and temp files
 *.log
 *.tmp
 *.swp
+*.swo
 
 # Environment
 .env
 .env.local
-*.env.*
+.env.*
 
 # Editors
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
 
-# Build directories
-build/
-dist/
-target/
+# Compression
+*.zip
+*.gz
+*.tar
+*.tgz
+*.bz2
+*.xz
+*.7z
+*.rar
+*.zst
+*.lz4
+*.lzh
+*.cab
+*.arj
+*.rpm
+*.deb
+*.Z
+*.lz
+*.lzo
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.tar.zst
 ```
