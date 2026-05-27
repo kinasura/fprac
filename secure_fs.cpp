@@ -1,68 +1,90 @@
 /**
- * Secure File Container with RC4 Stream Encryption
+ * Secure File Storage with RC4 Stream Encryption
  * 
- * This program implements a protected file storage in a single container file.
- * Each file is encrypted with RC4 using a unique key derived from:
- * - Global password (provided by user)
- * - Random 16-byte salt (unique per file)
+ * This program implements a protected file storage in a single disk image file.
+ * Each file is encrypted with RC4 using a seed derived from:
+ * - Master key (provided by user via -key)
+ * - Random 16-byte salt (unique per file, stored in the image)
  * 
- * Container format:
- * [Header][Encrypted Data][Header][Encrypted Data]...
+ * Image format (sequential records):
+ * [Record1][Record2][Record3]...
  * 
- * Header structure:
- * - uint32_t data_size (4 bytes, little-endian)
- * - uint32_t name_size (4 bytes, little-endian)
- * - uint8_t salt[16] (16 bytes)
- * - char filename[name_size] (variable length)
+ * Record structure:
+ * - uint32_t encrypted_data_size (4 bytes, little-endian) - size m of encrypted content
+ * - uint32_t name_size (4 bytes, little-endian) - length n of filename in bytes (no null terminator)
+ * - uint8_t salt[16] (16 bytes) - random salt unique for each file
+ * - char filename[name_size] (n bytes) - UTF-8 relative path from image root
+ * - uint8_t encrypted_data[m] (m bytes) - RC4 encrypted file content
+ * 
+ * Seed for RC4 = master_key + salt (concatenation in that order)
  */
 
 #include <iostream>
 #include <fstream>
+#include <sstream>
 #include <cstring>
 #include <cstdint>
 #include <vector>
 #include <string>
 #include <random>
-#include <openssl/sha.h>
-#include <unistd.h>
+#include <thread>
+#include <mutex>
+#include <queue>
+#include <condition_variable>
+#include <functional>
+#include <atomic>
+#include <dirent.h>
 #include <sys/stat.h>
+#include <unistd.h>
+#include <algorithm>
+#include <cstdlib>
 
 // ============================================================================
-// RC4 Stream Cipher Implementation
+// RC4 Stream Cipher Implementation (standalone, no external libraries)
 // ============================================================================
 
 class RC4 {
 private:
-    uint8_t S[256];  // State array
+    uint8_t S[256];  // State array (permutation)
     uint8_t i, j;    // Indices
 
 public:
-    RC4() : i(0), j(0) {}
+    RC4() : i(0), j(0) {
+        memset(S, 0, sizeof(S));
+    }
 
     /**
-     * Initialize RC4 with a key of arbitrary length (1-256 bytes)
+     * Initialize RC4 state using Key-Scheduling Algorithm (KSA)
+     * @param key Pointer to key bytes (seed = master_key + salt)
+     * @param key_len Length of the key in bytes (1-256)
      */
     void init(const uint8_t* key, size_t key_len) {
-        // Key-scheduling algorithm (KSA)
+        if (key_len == 0 || key_len > 256) {
+            return;
+        }
+
+        // Initialize S box with identity permutation
         for (int idx = 0; idx < 256; idx++) {
             S[idx] = static_cast<uint8_t>(idx);
         }
 
+        // Key-scheduling algorithm (KSA)
         uint8_t j_temp = 0;
         for (int idx = 0; idx < 256; idx++) {
             j_temp = (j_temp + S[idx] + key[idx % key_len]) % 256;
             std::swap(S[idx], S[j_temp]);
         }
 
+        // Reset indices for PRGA
         i = 0;
         j = 0;
     }
 
     /**
-     * Encrypt/decrypt a single byte (XOR with keystream)
+     * Generate next byte of keystream and XOR with input byte
+     * Pseudo-Random Generation Algorithm (PRGA)
      */
     uint8_t process(uint8_t byte) {
-        // Pseudo-random generation algorithm (PRGA)
         i = (i + 1) % 256;
         j = (j + S[i]) % 256;
         std::swap(S[i], S[j]);
@@ -73,6 +95,8 @@ public:
 
     /**
      * Encrypt/decrypt a buffer in-place
+     * @param buffer Pointer to data buffer
+     * @param len Length of buffer in bytes
      */
     void process_buffer(uint8_t* buffer, size_t len) {
         for (size_t idx = 0; idx < len; idx++) {
@@ -82,17 +106,59 @@ public:
 };
 
 // ============================================================================
-// Record Header Structure
+// Thread Pool Implementation (max 5 threads)
 // ============================================================================
 
-#pragma pack(push, 1)
-struct RecordHeader {
-    uint32_t data_size;   // Size of encrypted data
-    uint32_t name_size;   // Length of filename (including null terminator)
-    uint8_t salt[16];     // Random salt for key derivation
-    // Followed by: char filename[name_size]
+class ThreadPool {
+private:
+    std::vector<std::thread> workers;
+    std::queue<std::function<void()>> tasks;
+    std::mutex queue_mutex;
+    std::condition_variable condition;
+    std::atomic<bool> stop{false};
+
+public:
+    ThreadPool(size_t num_threads) {
+        for (size_t i = 0; i < num_threads; ++i) {
+            workers.emplace_back([this] {
+                while (true) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lock(queue_mutex);
+                        condition.wait(lock, [this] { 
+                            return stop.load() || !tasks.empty(); 
+                        });
+                        if (stop.load() && tasks.empty()) {
+                            return;
+                        }
+                        task = std::move(tasks.front());
+                        tasks.pop();
+                    }
+                    task();
+                }
+            });
+        }
+    }
+
+    template<class F>
+    void enqueue(F&& f) {
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            tasks.emplace(std::forward<F>(f));
+        }
+        condition.notify_one();
+    }
+
+    ~ThreadPool() {
+        stop.store(true);
+        condition.notify_all();
+        for (std::thread& worker : workers) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+    }
 };
-#pragma pack(pop)
 
 // ============================================================================
 // Utility Functions
@@ -113,27 +179,6 @@ void generate_salt(uint8_t* salt, size_t len) {
 }
 
 /**
- * Compute SHA-256 hash of data
- * Returns 32-byte hash
- */
-std::vector<uint8_t> sha256(const uint8_t* data, size_t len) {
-    std::vector<uint8_t> hash(SHA256_DIGEST_LENGTH);
-    SHA256(data, len, hash.data());
-    return hash;
-}
-
-/**
- * Derive RC4 key from global password and salt
- * RC4 key = SHA-256(password || salt)
- */
-std::vector<uint8_t> derive_key(const std::string& password, const uint8_t* salt, size_t salt_len) {
-    std::vector<uint8_t> combined(password.size() + salt_len);
-    std::memcpy(combined.data(), password.c_str(), password.size());
-    std::memcpy(combined.data() + password.size(), salt, salt_len);
-    return sha256(combined.data(), combined.size());
-}
-
-/**
  * Write uint32 in little-endian format
  */
 void write_uint32(std::ostream& os, uint32_t value) {
@@ -151,29 +196,378 @@ void write_uint32(std::ostream& os, uint32_t value) {
 uint32_t read_uint32(std::istream& is) {
     uint8_t buf[4];
     is.read(reinterpret_cast<char*>(buf), 4);
+    if (!is) {
+        throw std::runtime_error("Failed to read uint32");
+    }
     return buf[0] | (buf[1] << 8) | (buf[2] << 16) | (buf[3] << 24);
 }
 
+/**
+ * Get relative path from base directory
+ */
+std::string get_relative_path(const std::string& base_dir, const std::string& full_path) {
+    if (full_path.size() <= base_dir.size()) {
+        return full_path;
+    }
+    std::string rel = full_path.substr(base_dir.size());
+    if (!rel.empty() && rel[0] == '/') {
+        rel = rel.substr(1);
+    }
+    return rel;
+}
+
+/**
+ * Recursively collect all files from a directory
+ */
+void collect_files(const std::string& path, std::vector<std::string>& files, 
+                   const std::string& base_dir, const std::string& rel_prefix) {
+    DIR* dir = opendir(path.c_str());
+    if (!dir) {
+        return;
+    }
+
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        std::string name = entry->d_name;
+        if (name == "." || name == "..") {
+            continue;
+        }
+
+        std::string full_path = path + "/" + name;
+        std::string rel_path = rel_prefix.empty() ? name : rel_prefix + "/" + name;
+
+        struct stat st;
+        if (stat(full_path.c_str(), &st) != 0) {
+            continue;
+        }
+
+        if (S_ISDIR(st.st_mode)) {
+            collect_files(full_path, files, base_dir, rel_path);
+        } else if (S_ISREG(st.st_mode)) {
+            files.push_back(rel_path);
+        }
+    }
+    closedir(dir);
+}
+
 // ============================================================================
-// Secure Container Class
+// Secure Image Class
 // ============================================================================
 
-class SecureContainer {
+class SecureImage {
 private:
-    std::string container_path;
-    std::string password;
+    std::string image_path;
+    std::string master_key;
+    std::mutex write_mutex;
 
     static constexpr size_t BUFFER_SIZE = 4096;
 
+    /**
+     * Create RC4 seed from master key and salt
+     * Seed = master_key + salt (concatenation)
+     */
+    std::vector<uint8_t> create_seed(const uint8_t* salt, size_t salt_len) {
+        std::vector<uint8_t> seed(master_key.size() + salt_len);
+        std::memcpy(seed.data(), master_key.c_str(), master_key.size());
+        std::memcpy(seed.data() + master_key.size(), salt, salt_len);
+        return seed;
+    }
+
 public:
-    SecureContainer(const std::string& path, const std::string& pass)
-        : container_path(path), password(pass) {}
+    SecureImage(const std::string& path, const std::string& key)
+        : image_path(path), master_key(key) {}
 
     /**
-     * Add a file to the container
+     * Add a single file to the image (thread-safe)
+     * @param rel_path Relative path of the file within the image
+     * @param base_dir Base directory for resolving the actual file path
      */
-    bool add_file(const std::string& filename) {
+    bool add_file_threadsafe(const std::string& rel_path, const std::string& base_dir) {
+        std::string full_path = base_dir + "/" + rel_path;
+        
         // Check if source file exists and get its size
+        std::ifstream src(full_path, std::ios::binary | std::ios::ate);
+        if (!src) {
+            std::cerr << "Error: Cannot open source file: " << full_path << std::endl;
+            return false;
+        }
+
+        size_t file_size = src.tellg();
+        src.seekg(0, std::ios::beg);
+
+        // Generate random salt (16 bytes)
+        uint8_t salt[16];
+        generate_salt(salt, 16);
+
+        // Create seed for RC4: master_key + salt
+        std::vector<uint8_t> seed = create_seed(salt, 16);
+
+        // Open image for appending (with mutex for thread safety)
+        std::lock_guard<std::mutex> lock(write_mutex);
+        
+        std::ofstream image(image_path, std::ios::binary | std::ios::app);
+        if (!image) {
+            std::cerr << "Error: Cannot open/create image: " << image_path << std::endl;
+            return false;
+        }
+
+        // Get image end position
+        image.seekp(0, std::ios::end);
+
+        // Write header
+        uint32_t name_size = static_cast<uint32_t>(rel_path.size());
+        write_uint32(image, static_cast<uint32_t>(file_size));
+        write_uint32(image, name_size);
+        image.write(reinterpret_cast<char*>(salt), 16);
+        image.write(rel_path.c_str(), name_size);
+
+        // Encrypt and write data using RC4
+        RC4 rc4;
+        rc4.init(seed.data(), seed.size());
+
+        std::vector<uint8_t> buffer(BUFFER_SIZE);
+        size_t remaining = file_size;
+
+        while (remaining > 0) {
+            size_t to_read = std::min(BUFFER_SIZE, remaining);
+            src.read(reinterpret_cast<char*>(buffer.data()), to_read);
+            size_t bytes_read = src.gcount();
+
+            if (bytes_read == 0) break;
+
+            rc4.process_buffer(buffer.data(), bytes_read);
+            image.write(reinterpret_cast<char*>(buffer.data()), bytes_read);
+
+            remaining -= bytes_read;
+        }
+
+        image.close();
+        src.close();
+
+        std::cout << "Added: " << rel_path << " (" << file_size << " bytes)" << std::endl;
+        return true;
+    }
+
+    /**
+     * Add multiple files using a thread pool (max 5 threads)
+     */
+    bool add_files_parallel(const std::vector<std::string>& files, const std::string& base_dir) {
+        ThreadPool pool(5);  // Maximum 5 threads as per specification
+        std::atomic<int> success_count{0};
+        std::atomic<int> fail_count{0};
+
+        for (const auto& rel_path : files) {
+            pool.enqueue([this, &rel_path, &base_dir, &success_count, &fail_count] {
+                if (add_file_threadsafe(rel_path, base_dir)) {
+                    success_count++;
+                } else {
+                    fail_count++;
+                }
+            });
+        }
+
+        // Wait for all tasks to complete (pool destructor joins all threads)
+        // But we need to ensure the pool stays alive until all tasks are done
+        // The destructor will handle this
+        
+        return fail_count.load() == 0;
+    }
+
+    /**
+     * List all files in the image (sorted lexicographically)
+     */
+    bool list_files() {
+        std::ifstream image(image_path, std::ios::binary);
+        if (!image) {
+            std::cerr << "Error: Cannot open image: " << image_path << std::endl;
+            return false;
+        }
+
+        // Get image size for bounds checking
+        image.seekg(0, std::ios::end);
+        std::streampos image_size = image.tellg();
+        image.seekg(0, std::ios::beg);
+
+        std::vector<std::pair<std::string, uint32_t>> entries;
+        const size_t HEADER_BASE_SIZE = 24; // 4 + 4 + 16 bytes
+
+        while (image.peek() != EOF) {
+            std::streampos current_pos = image.tellg();
+            
+            // Check if we have enough bytes for base header
+            if (static_cast<size_t>(image_size - current_pos) < HEADER_BASE_SIZE) {
+                break;
+            }
+
+            try {
+                uint32_t data_size = read_uint32(image);
+                uint32_t name_size = read_uint32(image);
+
+                // Validate name_size
+                if (name_size == 0 || name_size > 10 * 1024 * 1024) {
+                    break;
+                }
+
+                // Check if we have enough bytes for salt and filename
+                if (static_cast<size_t>(image_size - image.tellg()) < 16 + name_size) {
+                    break;
+                }
+
+                uint8_t salt[16];
+                image.read(reinterpret_cast<char*>(salt), 16);
+
+                std::vector<char> filename(name_size);
+                image.read(filename.data(), name_size);
+
+                if (!image) {
+                    break;
+                }
+
+                std::string name(filename.data(), name_size);
+                entries.emplace_back(name, data_size);
+
+                // Skip encrypted data
+                if (static_cast<size_t>(image_size - image.tellg()) < data_size) {
+                    break;
+                }
+                image.seekg(data_size, std::ios::cur);
+
+            } catch (...) {
+                break;
+            }
+        }
+
+        image.close();
+
+        // Sort entries lexicographically by filename
+        std::sort(entries.begin(), entries.end(), 
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
+
+        // Output sorted list
+        for (const auto& entry : entries) {
+            std::cout << entry.first << "\t" << entry.second << std::endl;
+        }
+
+        if (entries.empty()) {
+            std::cout << "(empty image)" << std::endl;
+        }
+
+        return true;
+    }
+
+    /**
+     * Extract a file from the image
+     */
+    bool extract_file(const std::string& target_name, const std::string& output_path) {
+        std::ifstream image(image_path, std::ios::binary);
+        if (!image) {
+            std::cerr << "Error: Cannot open image: " << image_path << std::endl;
+            return false;
+        }
+
+        image.seekg(0, std::ios::end);
+        std::streampos image_size = image.tellg();
+        image.seekg(0, std::ios::beg);
+
+        bool found = false;
+        const size_t HEADER_BASE_SIZE = 24;
+
+        while (image.peek() != EOF && !found) {
+            std::streampos record_start = image.tellg();
+
+            if (static_cast<size_t>(image_size - record_start) < HEADER_BASE_SIZE) {
+                break;
+            }
+
+            try {
+                uint32_t data_size = read_uint32(image);
+                uint32_t name_size = read_uint32(image);
+
+                if (name_size == 0 || name_size > 10 * 1024 * 1024) {
+                    break;
+                }
+
+                if (static_cast<size_t>(image_size - image.tellg()) < 16 + name_size) {
+                    break;
+                }
+
+                uint8_t salt[16];
+                image.read(reinterpret_cast<char*>(salt), 16);
+
+                std::vector<char> filename(name_size);
+                image.read(filename.data(), name_size);
+
+                if (!image) {
+                    break;
+                }
+
+                std::string name(filename.data(), name_size);
+
+                if (name == target_name) {
+                    found = true;
+
+                    if (static_cast<size_t>(image_size - image.tellg()) < data_size) {
+                        std::cerr << "Error: Data exceeds image bounds" << std::endl;
+                        return false;
+                    }
+
+                    // Create seed for RC4 decryption
+                    std::vector<uint8_t> seed = create_seed(salt, 16);
+
+                    // Open output file
+                    std::ofstream output(output_path, std::ios::binary);
+                    if (!output) {
+                        std::cerr << "Error: Cannot create output file: " << output_path << std::endl;
+                        return false;
+                    }
+
+                    // Initialize RC4 with fresh state
+                    RC4 rc4;
+                    rc4.init(seed.data(), seed.size());
+
+                    // Decrypt and write data
+                    std::vector<uint8_t> buffer(BUFFER_SIZE);
+                    size_t remaining = data_size;
+
+                    while (remaining > 0) {
+                        size_t to_read = std::min(BUFFER_SIZE, remaining);
+                        image.read(reinterpret_cast<char*>(buffer.data()), to_read);
+                        size_t bytes_read = image.gcount();
+
+                        if (bytes_read == 0) break;
+
+                        rc4.process_buffer(buffer.data(), bytes_read);
+                        output.write(reinterpret_cast<char*>(buffer.data()), bytes_read);
+
+                        remaining -= bytes_read;
+                    }
+
+                    output.close();
+                    std::cout << "Extracted: " << target_name << " -> " << output_path 
+                              << " (" << data_size << " bytes)" << std::endl;
+                } else {
+                    // Skip encrypted data
+                    if (static_cast<size_t>(image_size - image.tellg()) < data_size) {
+                        break;
+                    }
+                    image.seekg(data_size, std::ios::cur);
+                }
+
+            } catch (...) {
+                break;
+            }
+        }
+
+        image.close();
+
+        if (!found) {
+            std::cerr << "Error: File not found in image: " << target_name << std::endl;
+            return false;
+        }
+
+        return true;
+    }
+};
         std::ifstream src(filename, std::ios::binary | std::ios::ate);
         if (!src) {
             std::cerr << "Error: Cannot open source file: " << filename << std::endl;
