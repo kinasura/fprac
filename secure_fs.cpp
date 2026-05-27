@@ -244,12 +244,40 @@ public:
             return false;
         }
 
+        // Get container size for bounds checking
+        container.seekg(0, std::ios::end);
+        std::streampos container_size = container.tellg();
+        container.seekg(0, std::ios::beg);
+
         bool found_any = false;
+        const size_t HEADER_BASE_SIZE = 24; // 4 + 4 + 16 bytes
 
         while (container.peek() != EOF) {
+            // Check if we have enough bytes for base header
+            std::streampos current_pos = container.tellg();
+            if (static_cast<size_t>(container_size - current_pos) < HEADER_BASE_SIZE) {
+                std::cerr << "Warning: Incomplete header at position " << current_pos 
+                          << " (only " << (container_size - current_pos) << " bytes remaining)" << std::endl;
+                break;
+            }
+
             // Read header
             uint32_t data_size = read_uint32(container);
             uint32_t name_size = read_uint32(container);
+
+            // Validate name_size to prevent reading beyond bounds
+            if (name_size == 0 || name_size > 1024) {
+                std::cerr << "Warning: Invalid name_size (" << name_size 
+                          << ") at position " << current_pos << std::endl;
+                break;
+            }
+
+            // Check if we have enough bytes for salt and filename
+            if (static_cast<size_t>(container_size - container.tellg()) < 16 + name_size) {
+                std::cerr << "Warning: Record exceeds container bounds at position " 
+                          << current_pos << std::endl;
+                break;
+            }
 
             uint8_t salt[16];
             container.read(reinterpret_cast<char*>(salt), 16);
@@ -262,8 +290,20 @@ public:
                 return false;
             }
 
+            // Ensure null-termination for safety
+            if (filename.back() != '\0') {
+                filename.push_back('\0');
+            }
+
             std::cout << filename.data() << " (" << data_size << " bytes)" << std::endl;
             found_any = true;
+
+            // Check if data extends beyond container
+            if (static_cast<size_t>(container_size - container.tellg()) < data_size) {
+                std::cerr << "Warning: Data exceeds container bounds for file \"" 
+                          << filename.data() << "\"" << std::endl;
+                break;
+            }
 
             // Skip encrypted data
             container.seekg(data_size, std::ios::cur);
@@ -288,15 +328,41 @@ public:
             return false;
         }
 
+        // Get container size for bounds checking
+        container.seekg(0, std::ios::end);
+        std::streampos container_size = container.tellg();
+        container.seekg(0, std::ios::beg);
+
         bool found = false;
+        const size_t HEADER_BASE_SIZE = 24; // 4 + 4 + 16 bytes
 
         while (container.peek() != EOF && !found) {
             // Remember position at start of record
             std::streampos record_start = container.tellg();
 
+            // Check if we have enough bytes for base header
+            if (static_cast<size_t>(container_size - record_start) < HEADER_BASE_SIZE) {
+                std::cerr << "Warning: Incomplete header at position " << record_start << std::endl;
+                break;
+            }
+
             // Read header
             uint32_t data_size = read_uint32(container);
             uint32_t name_size = read_uint32(container);
+
+            // Validate name_size
+            if (name_size == 0 || name_size > 1024) {
+                std::cerr << "Warning: Invalid name_size (" << name_size 
+                          << ") at position " << record_start << std::endl;
+                break;
+            }
+
+            // Check if we have enough bytes for salt and filename
+            if (static_cast<size_t>(container_size - container.tellg()) < 16 + name_size) {
+                std::cerr << "Warning: Record exceeds container bounds at position " 
+                          << record_start << std::endl;
+                break;
+            }
 
             uint8_t salt[16];
             container.read(reinterpret_cast<char*>(salt), 16);
@@ -309,9 +375,21 @@ public:
                 return false;
             }
 
+            // Ensure null-termination for safety
+            if (filename.back() != '\0') {
+                filename.push_back('\0');
+            }
+
             // Check if this is the target file
-            if (filename.data() == target_name) {
+            if (std::string(filename.data()) == target_name) {
                 found = true;
+
+                // Check if data extends beyond container
+                if (static_cast<size_t>(container_size - container.tellg()) < data_size) {
+                    std::cerr << "Error: Data exceeds container bounds for file \"" 
+                              << filename.data() << "\"" << std::endl;
+                    return false;
+                }
 
                 // Derive RC4 key
                 std::vector<uint8_t> rc4_key = derive_key(password, salt, 16);
@@ -348,6 +426,12 @@ public:
                 std::cout << "Extracted: " << target_name << " -> " << output_path 
                           << " (" << data_size << " bytes)" << std::endl;
             } else {
+                // Check bounds before skipping
+                if (static_cast<size_t>(container_size - container.tellg()) < data_size) {
+                    std::cerr << "Warning: Data exceeds container bounds while searching for \"" 
+                              << target_name << "\"" << std::endl;
+                    break;
+                }
                 // Skip encrypted data
                 container.seekg(data_size, std::ios::cur);
             }
