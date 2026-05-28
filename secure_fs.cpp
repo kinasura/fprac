@@ -568,390 +568,218 @@ public:
         return true;
     }
 };
-        std::ifstream src(filename, std::ios::binary | std::ios::ate);
-        if (!src) {
-            std::cerr << "Error: Cannot open source file: " << filename << std::endl;
-            return false;
-        }
-
-        size_t file_size = src.tellg();
-        src.seekg(0, std::ios::beg);
-
-        // Generate random salt
-        uint8_t salt[16];
-        generate_salt(salt, 16);
-
-        // Derive RC4 key
-        std::vector<uint8_t> rc4_key = derive_key(password, salt, 16);
-
-        // Open container for appending
-        std::ofstream container(container_path, std::ios::binary | std::ios::app);
-        if (!container) {
-            std::cerr << "Error: Cannot open/create container: " << container_path << std::endl;
-            return false;
-        }
-
-        // Prepare header
-        std::string name_with_path = filename;
-        uint32_t name_size = static_cast<uint32_t>(name_with_path.size() + 1); // Include null terminator
-
-        // Write header
-        write_uint32(container, static_cast<uint32_t>(file_size));
-        write_uint32(container, name_size);
-        container.write(reinterpret_cast<char*>(salt), 16);
-        container.write(name_with_path.c_str(), name_size);
-
-        // Encrypt and write data
-        RC4 rc4;
-        rc4.init(rc4_key.data(), rc4_key.size());
-
-        std::vector<uint8_t> buffer(BUFFER_SIZE);
-        size_t remaining = file_size;
-
-        while (remaining > 0) {
-            size_t to_read = std::min(BUFFER_SIZE, remaining);
-            src.read(reinterpret_cast<char*>(buffer.data()), to_read);
-            size_t bytes_read = src.gcount();
-
-            if (bytes_read == 0) break;
-
-            rc4.process_buffer(buffer.data(), bytes_read);
-            container.write(reinterpret_cast<char*>(buffer.data()), bytes_read);
-
-            remaining -= bytes_read;
-        }
-
-        container.close();
-        src.close();
-
-        std::cout << "Added: " << filename << " (" << file_size << " bytes)" << std::endl;
-        return true;
-    }
-
-    /**
-     * List all files in the container
-     */
-    bool list_files() {
-        std::ifstream container(container_path, std::ios::binary);
-        if (!container) {
-            std::cerr << "Error: Cannot open container: " << container_path << std::endl;
-            return false;
-        }
-
-        // Get container size for bounds checking
-        container.seekg(0, std::ios::end);
-        std::streampos container_size = container.tellg();
-        container.seekg(0, std::ios::beg);
-
-        bool found_any = false;
-        const size_t HEADER_BASE_SIZE = 24; // 4 + 4 + 16 bytes
-
-        while (container.peek() != EOF) {
-            // Check if we have enough bytes for base header
-            std::streampos current_pos = container.tellg();
-            if (static_cast<size_t>(container_size - current_pos) < HEADER_BASE_SIZE) {
-                std::cerr << "Warning: Incomplete header at position " << current_pos 
-                          << " (only " << (container_size - current_pos) << " bytes remaining)" << std::endl;
-                break;
-            }
-
-            // Read header
-            uint32_t data_size = read_uint32(container);
-            uint32_t name_size = read_uint32(container);
-
-            // Validate name_size to prevent reading beyond bounds
-            if (name_size == 0 || name_size > 1024) {
-                std::cerr << "Warning: Invalid name_size (" << name_size 
-                          << ") at position " << current_pos << std::endl;
-                break;
-            }
-
-            // Check if we have enough bytes for salt and filename
-            if (static_cast<size_t>(container_size - container.tellg()) < 16 + name_size) {
-                std::cerr << "Warning: Record exceeds container bounds at position " 
-                          << current_pos << std::endl;
-                break;
-            }
-
-            uint8_t salt[16];
-            container.read(reinterpret_cast<char*>(salt), 16);
-
-            std::vector<char> filename(name_size);
-            container.read(filename.data(), name_size);
-
-            if (!container) {
-                std::cerr << "Error: Corrupted container format" << std::endl;
-                return false;
-            }
-
-            // Ensure null-termination for safety
-            if (filename.back() != '\0') {
-                filename.push_back('\0');
-            }
-
-            std::cout << filename.data() << " (" << data_size << " bytes)" << std::endl;
-            found_any = true;
-
-            // Check if data extends beyond container
-            if (static_cast<size_t>(container_size - container.tellg()) < data_size) {
-                std::cerr << "Warning: Data exceeds container bounds for file \"" 
-                          << filename.data() << "\"" << std::endl;
-                break;
-            }
-
-            // Skip encrypted data
-            container.seekg(data_size, std::ios::cur);
-        }
-
-        container.close();
-
-        if (!found_any) {
-            std::cout << "(empty container)" << std::endl;
-        }
-
-        return true;
-    }
-
-    /**
-     * Extract a file from the container
-     */
-    bool extract_file(const std::string& target_name, const std::string& output_path) {
-        std::ifstream container(container_path, std::ios::binary);
-        if (!container) {
-            std::cerr << "Error: Cannot open container: " << container_path << std::endl;
-            return false;
-        }
-
-        // Get container size for bounds checking
-        container.seekg(0, std::ios::end);
-        std::streampos container_size = container.tellg();
-        container.seekg(0, std::ios::beg);
-
-        bool found = false;
-        const size_t HEADER_BASE_SIZE = 24; // 4 + 4 + 16 bytes
-
-        while (container.peek() != EOF && !found) {
-            // Remember position at start of record
-            std::streampos record_start = container.tellg();
-
-            // Check if we have enough bytes for base header
-            if (static_cast<size_t>(container_size - record_start) < HEADER_BASE_SIZE) {
-                std::cerr << "Warning: Incomplete header at position " << record_start << std::endl;
-                break;
-            }
-
-            // Read header
-            uint32_t data_size = read_uint32(container);
-            uint32_t name_size = read_uint32(container);
-
-            // Validate name_size
-            if (name_size == 0 || name_size > 1024) {
-                std::cerr << "Warning: Invalid name_size (" << name_size 
-                          << ") at position " << record_start << std::endl;
-                break;
-            }
-
-            // Check if we have enough bytes for salt and filename
-            if (static_cast<size_t>(container_size - container.tellg()) < 16 + name_size) {
-                std::cerr << "Warning: Record exceeds container bounds at position " 
-                          << record_start << std::endl;
-                break;
-            }
-
-            uint8_t salt[16];
-            container.read(reinterpret_cast<char*>(salt), 16);
-
-            std::vector<char> filename(name_size);
-            container.read(filename.data(), name_size);
-
-            if (!container) {
-                std::cerr << "Error: Corrupted container format" << std::endl;
-                return false;
-            }
-
-            // Ensure null-termination for safety
-            if (filename.back() != '\0') {
-                filename.push_back('\0');
-            }
-
-            // Check if this is the target file
-            if (std::string(filename.data()) == target_name) {
-                found = true;
-
-                // Check if data extends beyond container
-                if (static_cast<size_t>(container_size - container.tellg()) < data_size) {
-                    std::cerr << "Error: Data exceeds container bounds for file \"" 
-                              << filename.data() << "\"" << std::endl;
-                    return false;
-                }
-
-                // Derive RC4 key
-                std::vector<uint8_t> rc4_key = derive_key(password, salt, 16);
-
-                // Open output file
-                std::ofstream output(output_path, std::ios::binary);
-                if (!output) {
-                    std::cerr << "Error: Cannot create output file: " << output_path << std::endl;
-                    return false;
-                }
-
-                // Initialize RC4 with fresh context
-                RC4 rc4;
-                rc4.init(rc4_key.data(), rc4_key.size());
-
-                // Decrypt and write data
-                std::vector<uint8_t> buffer(BUFFER_SIZE);
-                size_t remaining = data_size;
-
-                while (remaining > 0) {
-                    size_t to_read = std::min(BUFFER_SIZE, remaining);
-                    container.read(reinterpret_cast<char*>(buffer.data()), to_read);
-                    size_t bytes_read = container.gcount();
-
-                    if (bytes_read == 0) break;
-
-                    rc4.process_buffer(buffer.data(), bytes_read);
-                    output.write(reinterpret_cast<char*>(buffer.data()), bytes_read);
-
-                    remaining -= bytes_read;
-                }
-
-                output.close();
-                std::cout << "Extracted: " << target_name << " -> " << output_path 
-                          << " (" << data_size << " bytes)" << std::endl;
-            } else {
-                // Check bounds before skipping
-                if (static_cast<size_t>(container_size - container.tellg()) < data_size) {
-                    std::cerr << "Warning: Data exceeds container bounds while searching for \"" 
-                              << target_name << "\"" << std::endl;
-                    break;
-                }
-                // Skip encrypted data
-                container.seekg(data_size, std::ios::cur);
-            }
-        }
-
-        container.close();
-
-        if (!found) {
-            std::cerr << "Error: File not found in container: " << target_name << std::endl;
-            return false;
-        }
-
-        return true;
-    }
-};
 
 // ============================================================================
-// Command Line Interface
+// ЧАСТЬ 5: ГЛАВНАЯ ФУНКЦИЯ И ОБРАБОТКА КОМАНДНОЙ СТРОКИ
 // ============================================================================
 
+/**
+ * @brief Вывод справки по использованию программы
+ */
 void print_usage(const char* prog_name) {
+    std::cerr << "Secure File Storage with RC4 Encryption" << std::endl;
+    std::cerr << std::endl;
     std::cerr << "Usage:" << std::endl;
-    std::cerr << "  " << prog_name << " --key=<password> add <container> <file>" << std::endl;
-    std::cerr << "  " << prog_name << " --key=<password> list <container>" << std::endl;
-    std::cerr << "  " << prog_name << " --key=<password> extract <container> <filename> [output]" << std::endl;
+    std::cerr << "  Add files to image:" << std::endl;
+    std::cerr << "    " << prog_name << " -add -key <password> -image <image_file> <files/dirs>..." << std::endl;
+    std::cerr << std::endl;
+    std::cerr << "  List files in image:" << std::endl;
+    std::cerr << "    " << prog_name << " -list -image <image_file>" << std::endl;
+    std::cerr << std::endl;
+    std::cerr << "  Extract file from image:" << std::endl;
+    std::cerr << "    " << prog_name << " -get -image <image_file> -key <password> -out <output> <filename>" << std::endl;
     std::cerr << std::endl;
     std::cerr << "Options:" << std::endl;
-    std::cerr << "  --key=<password>   Global encryption password (required)" << std::endl;
-    std::cerr << "  --help             Show this help message" << std::endl;
+    std::cerr << "  -add              Add files/directories to image" << std::endl;
+    std::cerr << "  -list             List all files in image" << std::endl;
+    std::cerr << "  -get              Extract file from image" << std::endl;
+    std::cerr << "  -key <password>   Master encryption key" << std::endl;
+    std::cerr << "  -image <file>     Path to disk image file" << std::endl;
+    std::cerr << "  -out <file>       Output file path (for -get)" << std::endl;
+    std::cerr << "  -help             Show this help message" << std::endl;
 }
 
+/**
+ * @brief Точка входа программы
+ * 
+ * ОБРАБОТКА АРГУМЕНТОВ:
+ * Программа поддерживает три режима работы:
+ * 1. -add: Добавление файлов/директорий в образ
+ * 2. -list: Вывод списка файлов
+ * 3. -get: Извлечение файла
+ * 
+ * ПРИМЕРЫ:
+ *   ./secure_fs -add -key "secret" -image data.img file.txt docs/
+ *   ./secure_fs -list -image data.img
+ *   ./secure_fs -get -image data.img -key "secret" -out out.txt file.txt
+ */
 int main(int argc, char* argv[]) {
+    // Проверка минимального количества аргументов
     if (argc < 2) {
         print_usage(argv[0]);
         return 1;
     }
 
-    std::string password;
-    std::string mode;
-    std::vector<std::string> args;
+    // Переменные для хранения параметров
+    std::string mode;           // Режим: add, list, get
+    std::string key;            // Мастер-ключ
+    std::string image_path;     // Путь к образу
+    std::string output_path;    // Путь вывода (для -get)
+    std::vector<std::string> files_to_add;  // Файлы для добавления
 
-    // Parse arguments
+    // Парсинг аргументов командной строки
     for (int idx = 1; idx < argc; idx++) {
         std::string arg = argv[idx];
 
-        if (arg == "--help" || arg == "-h") {
+        // Помощь
+        if (arg == "-help" || arg == "--help") {
             print_usage(argv[0]);
             return 0;
-        } else if (arg.rfind("--key=", 0) == 0) {
-            password = arg.substr(6);
-        } else if (arg.rfind("--key", 0) == 0 && arg[5] == '=') {
-            password = arg.substr(6);
-        } else if (mode.empty() && (arg == "add" || arg == "list" || arg == "extract")) {
-            mode = arg;
-        } else {
-            args.push_back(arg);
+        }
+        // Режим -add
+        else if (arg == "-add") {
+            mode = "add";
+        }
+        // Режим -list
+        else if (arg == "-list") {
+            mode = "list";
+        }
+        // Режим -get
+        else if (arg == "-get") {
+            mode = "get";
+        }
+        // Ключ шифрования
+        else if (arg == "-key" && idx + 1 < argc) {
+            key = argv[++idx];
+        }
+        // Путь к образу
+        else if (arg == "-image" && idx + 1 < argc) {
+            image_path = argv[++idx];
+        }
+        // Путь вывода
+        else if (arg == "-out" && idx + 1 < argc) {
+            output_path = argv[++idx];
+        }
+        // Остальные аргументы считаем файлами для добавления
+        else if (arg[0] != '-') {
+            files_to_add.push_back(arg);
+        }
+        else {
+            std::cerr << "Error: Unknown option: " << arg << std::endl;
+            print_usage(argv[0]);
+            return 1;
         }
     }
 
-    // Check for password in environment if not provided
-    if (password.empty()) {
-        const char* env_pass = std::getenv("SECURE_FS_KEY");
-        if (env_pass) {
-            password = env_pass;
-        }
-    }
-
-    if (password.empty()) {
-        std::cerr << "Error: Password required. Use --key=<password> or set SECURE_FS_KEY environment variable." << std::endl;
-        print_usage(argv[0]);
-        return 1;
-    }
-
+    // ВАЛИДАЦИЯ ПАРАМЕТРОВ
+    
+    // Проверка наличия режима
     if (mode.empty()) {
-        std::cerr << "Error: Mode required (add, list, extract)" << std::endl;
+        std::cerr << "Error: Mode required (-add, -list, or -get)" << std::endl;
         print_usage(argv[0]);
         return 1;
     }
 
-    // Execute mode
-    SecureContainer container("", password);
+    // Проверка наличия ключа для режимов add и get
+    if ((mode == "add" || mode == "get") && key.empty()) {
+        std::cerr << "Error: -key required for " << mode << " mode" << std::endl;
+        print_usage(argv[0]);
+        return 1;
+    }
 
+    // Проверка наличия пути к образу
+    if (image_path.empty()) {
+        std::cerr << "Error: -image required" << std::endl;
+        print_usage(argv[0]);
+        return 1;
+    }
+
+    // ВЫПОЛНЕНИЕ РЕЖИМА
+    
     if (mode == "add") {
-        if (args.size() < 2) {
-            std::cerr << "Error: add requires <container> and <file> arguments" << std::endl;
+        // === РЕЖИМ ДОБАВЛЕНИЯ ФАЙЛОВ ===
+        if (files_to_add.empty()) {
+            std::cerr << "Error: No files specified for adding" << std::endl;
             return 1;
         }
-        container = SecureContainer(args[0], password);
-        if (!container.add_file(args[1])) {
+
+        SecureImage image(image_path, key);
+        std::vector<std::string> all_files;
+
+        // Сбор всех файлов из указанных путей
+        for (const auto& path : files_to_add) {
+            struct stat st;
+            if (stat(path.c_str(), &st) != 0) {
+                std::cerr << "Error: Cannot access: " << path << std::endl;
+                continue;
+            }
+
+            if (S_ISDIR(st.st_mode)) {
+                // Директория - рекурсивный обход
+                collect_files(path, all_files, path, "");
+            } else if (S_ISREG(st.st_mode)) {
+                // Обычный файл - добавляем как есть
+                all_files.push_back(path);
+            }
+        }
+
+        if (all_files.empty()) {
+            std::cerr << "Error: No valid files to add" << std::endl;
             return 1;
+        }
+
+        // Параллельное добавление файлов
+        // Для каждого файла определяем базовую директорию
+        for (const auto& path : files_to_add) {
+            struct stat st;
+            if (stat(path.c_str(), &st) == 0) {
+                if (S_ISDIR(st.st_mode)) {
+                    std::vector<std::string> dir_files;
+                    collect_files(path, dir_files, path, "");
+                    image.add_files_parallel(dir_files, path);
+                } else if (S_ISREG(st.st_mode)) {
+                    // Для одиночного файла base_dir - это родительская директория
+                    std::string base_dir = ".";
+                    size_t pos = path.rfind('/');
+                    if (pos != std::string::npos) {
+                        base_dir = path.substr(0, pos);
+                    }
+                    std::vector<std::string> single_file = {path};
+                    image.add_files_parallel(single_file, base_dir);
+                }
+            }
         }
 
     } else if (mode == "list") {
-        if (args.empty()) {
-            std::cerr << "Error: list requires <container> argument" << std::endl;
-            return 1;
-        }
-        container = SecureContainer(args[0], password);
-        if (!container.list_files()) {
+        // === РЕЖИМ СПИСКА ФАЙЛОВ ===
+        SecureImage image(image_path, "");  // Ключ не нужен для list
+        if (!image.list_files()) {
             return 1;
         }
 
-    } else if (mode == "extract") {
-        if (args.size() < 2) {
-            std::cerr << "Error: extract requires <container> and <filename> arguments" << std::endl;
+    } else if (mode == "get") {
+        // === РЕЖИМ ИЗВЛЕЧЕНИЯ ФАЙЛА ===
+        if (files_to_add.empty()) {
+            std::cerr << "Error: Filename required for extraction" << std::endl;
             return 1;
         }
-        container = SecureContainer(args[0], password);
-        std::string output = (args.size() >= 3) ? args[2] : args[1];
+
+        std::string target_file = files_to_add[0];
         
-        // Extract just the filename from path if output equals input filename
-        if (output == args[1]) {
-            size_t pos = args[1].rfind('/');
+        // Если output_path не указан, используем имя целевого файла
+        if (output_path.empty()) {
+            output_path = target_file;
+            // Удаляем путь, оставляем только имя
+            size_t pos = target_file.rfind('/');
             if (pos != std::string::npos) {
-                output = args[1].substr(pos + 1);
+                output_path = target_file.substr(pos + 1);
             }
         }
-        
-        if (!container.extract_file(args[1], output)) {
+
+        SecureImage image(image_path, key);
+        if (!image.extract_file(target_file, output_path)) {
             return 1;
         }
-
-    } else {
-        std::cerr << "Error: Unknown mode: " << mode << std::endl;
-        print_usage(argv[0]);
-        return 1;
     }
 
     return 0;
